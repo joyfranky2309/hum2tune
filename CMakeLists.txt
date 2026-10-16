@@ -13,6 +13,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_executable(hum2tune
     src/main.cpp
     src/pitch_detector.cpp
+    src/yin_pitch_detector.cpp
     src/wav_reader.cpp
 )
 
