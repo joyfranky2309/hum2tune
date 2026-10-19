@@ -21,17 +21,6 @@ struct PitchFrame {
     int midiNote; // -1 means no detected pitch
 };
 
-double calculateRms(const std::vector<std::int16_t>& samples) {
-    double sumSquares = 0.0;
-
-    for (const auto sample : samples) {
-        const double value = static_cast<double>(sample);
-        sumSquares += value * value;
-    }
-
-    return std::sqrt(sumSquares / static_cast<double>(samples.size()));
-}
-
 int frequencyToMidi(double frequency) {
     if (frequency <= 0.0) {
         return -1;
@@ -59,7 +48,7 @@ std::string noteName(int midiNote) {
 int main(int argc, char* argv[]) {
     try {
         const std::string path =
-            argc > 1 ? argv[1] : "test_audio/test.wav";
+            argc > 1 ? argv[1] : "test_audio/saregamaogg.wav";
         const std::string midiPath = argc > 2 ? argv[2] : "output.mid";
 
         const WavData wav = readWav(path);
@@ -83,69 +72,20 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        std::vector<double> frameRmsValues;
+        std::vector<PitchFrame> frames;
+
         for (std::size_t start = 0;
              start + frameSize <= wav.samples.size();
              start += hopSize) {
-            const std::vector<std::int16_t> frame(
-                wav.samples.begin() + start,
-                wav.samples.begin() + start + frameSize
-            );
-            frameRmsValues.push_back(calculateRms(frame));
-        }
-
-        constexpr double minimumNoiseFloor = 1.0;
-        constexpr double onsetMultiplier = 3.0;
-        constexpr double offsetMultiplier = 1.5;
-        constexpr double releaseSeconds = 0.10;
-        constexpr double noiseFloorRiseRate = 0.001;
-        const std::size_t releaseFrames =
-            static_cast<std::size_t>(std::ceil(releaseSeconds / hopSeconds));
-        double noiseFloor = std::max(
-            minimumNoiseFloor,
-            *std::min_element(frameRmsValues.begin(), frameRmsValues.end())
-        );
-        bool noteActive = false;
-        std::size_t belowOffsetFrames = 0;
-        std::vector<PitchFrame> frames;
-        frames.reserve(frameRmsValues.size());
-
-        std::size_t frameIndex = 0;
-        for (std::size_t start = 0;
-             start + frameSize <= wav.samples.size();
-             start += hopSize, ++frameIndex) {
 
             std::vector<std::int16_t> frame(
                 wav.samples.begin() + start,
                 wav.samples.begin() + start + frameSize
             );
 
-            const double rms = frameRmsValues[frameIndex];
-            const double onsetThreshold = noiseFloor * onsetMultiplier;
-            const double offsetThreshold = noiseFloor * offsetMultiplier;
-
-            if (!noteActive && rms >= onsetThreshold) {
-                noteActive = true;
-            }
-
-            bool isVoiced = noteActive;
-            if (noteActive && rms < offsetThreshold) {
-                ++belowOffsetFrames;
-                if (belowOffsetFrames >= releaseFrames) {
-                    noteActive = false;
-                    belowOffsetFrames = 0;
-                    isVoiced = false;
-                }
-            } else if (noteActive) {
-                belowOffsetFrames = 0;
-            }
-
-            const double autocorrelationFrequency = !isVoiced
-                ? 0.0
-                : detectPitch(frame, wav.sampleRate);
-            const double yinFrequency = !isVoiced
-                ? 0.0
-                : detectPitchYin(frame, wav.sampleRate);
+            const double autocorrelationFrequency =
+                detectPitch(frame, wav.sampleRate);
+            const double yinFrequency = detectPitchYin(frame, wav.sampleRate);
 
             frames.push_back({
                 static_cast<double>(start) / wav.sampleRate,
@@ -153,13 +93,6 @@ int main(int argc, char* argv[]) {
                 yinFrequency,
                 yinFrequency > 0.0 ? frequencyToMidi(yinFrequency) : -1
             });
-
-            if (rms < noiseFloor) {
-                noiseFloor = rms;
-            } else {
-                noiseFloor +=
-                    noiseFloorRiseRate * (rms - noiseFloor);
-            }
         }
 
         std::vector<int> pitchNotes;
