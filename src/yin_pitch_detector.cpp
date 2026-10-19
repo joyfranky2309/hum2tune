@@ -15,7 +15,7 @@ double detectPitchYin(
 
     constexpr double minFrequency = 80.0;
     constexpr double maxFrequency = 1000.0;
-    constexpr double threshold = 0.15;
+    constexpr double threshold = 0.20;
     constexpr std::size_t maxWindowSize = 4096;
 
     const std::size_t windowSize =
