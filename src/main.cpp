@@ -48,8 +48,8 @@ std::string noteName(int midiNote) {
 int main(int argc, char* argv[]) {
     try {
         const std::string path =
-            argc > 1 ? argv[1] : "test_audio/saregamaogg.wav";
-        const std::string midiPath = argc > 2 ? argv[2] : "output.mid";
+            argc > 1 ? argv[1] : "test_audio/nenu_nenugaslowed.wav";
+        const std::string midiPath  = argc > 2 ? argv[2] : "output.mid";
 
         const WavData wav = readWav(path);
 
@@ -83,9 +83,23 @@ int main(int argc, char* argv[]) {
                 wav.samples.begin() + start + frameSize
             );
 
+            const double hannWindowScale =
+                frame.size() > 1 ? (2.0 * std::acos(-1.0) /
+                    static_cast<double>(frame.size() - 1)) : 0.0;
+            std::vector<std::int16_t> windowedFrame(frame.size());
+            for (std::size_t i = 0; i < frame.size(); ++i) {
+                const double window = 0.5 - 0.5 * std::cos(
+                    hannWindowScale * static_cast<double>(i)
+                );
+                windowedFrame[i] = static_cast<std::int16_t>(
+                    std::round(static_cast<double>(frame[i]) * window)
+                );
+            }
+
             const double autocorrelationFrequency =
-                detectPitch(frame, wav.sampleRate);
-            const double yinFrequency = detectPitchYin(frame, wav.sampleRate);
+                detectPitch(windowedFrame, wav.sampleRate);
+            const double yinFrequency =
+                detectPitchYin(windowedFrame, wav.sampleRate);
 
             frames.push_back({
                 static_cast<double>(start) / wav.sampleRate,
@@ -103,17 +117,35 @@ int main(int argc, char* argv[]) {
 
         constexpr std::size_t octaveContextFrames = 10;
         for (std::size_t i = 0; i < frames.size(); ++i) {
-            if (frames[i].autocorrelationFrequency <= 0.0 ||
-                frames[i].yinFrequency <= 0.0) {
+            const bool hasAutocorrelation =
+                frames[i].autocorrelationFrequency > 0.0;
+            const bool hasYin = frames[i].yinFrequency > 0.0;
+            if (!hasAutocorrelation && !hasYin) {
                 continue;
             }
 
-            const int autocorrelationNote =
-                frequencyToMidi(frames[i].autocorrelationFrequency);
-            const int yinNote = frequencyToMidi(frames[i].yinFrequency);
-            if (std::abs(autocorrelationNote - yinNote) < 11 ||
-                std::abs(autocorrelationNote - yinNote) > 13) {
+            const int autocorrelationNote = hasAutocorrelation
+                ? frequencyToMidi(frames[i].autocorrelationFrequency)
+                : -1;
+            const int yinNote = hasYin
+                ? frequencyToMidi(frames[i].yinFrequency)
+                : -1;
+
+            if (hasYin) {
+                pitchNotes[i] = yinNote;
+            } else if (hasAutocorrelation) {
+                pitchNotes[i] = autocorrelationNote;
+            }
+
+            if (hasAutocorrelation && hasYin &&
+                std::abs(autocorrelationNote - yinNote) == 12) {
+                pitchNotes[i] = yinNote;
                 continue;
+            }
+
+            if (hasAutocorrelation && hasYin &&
+                std::abs(autocorrelationNote - yinNote) > 1) {
+                pitchNotes[i] = yinNote;
             }
 
             const std::size_t contextBegin =

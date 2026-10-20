@@ -16,7 +16,7 @@ double detectPitch(
 
     constexpr double minFrequency = 80.0;
     constexpr double maxFrequency = 1000.0;
-    constexpr double peakThreshold = 0.80;
+    constexpr double peakThreshold = 0.55;
     constexpr std::size_t maxWindowSize = 4096;
 
     const std::size_t windowSize =
