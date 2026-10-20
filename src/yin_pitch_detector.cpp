@@ -5,58 +5,54 @@
 #include <cstddef>
 #include <vector>
 
-double detectPitchYin(
-    const std::vector<std::int16_t>& samples,
-    std::uint32_t sampleRate
+PitchEstimate detectPitchYin(
+    const std::vector<double>& samples,
+    std::uint32_t sampleRate,
+    const PitchDetectionOptions& options
 ) {
-    if (sampleRate == 0 || samples.size() < 2) {
-        return 0.0;
+    if (sampleRate == 0 || samples.size() < 2 ||
+        options.minFrequency <= 0.0 ||
+        options.maxFrequency <= options.minFrequency) {
+        return {};
     }
 
-    constexpr double minFrequency = 80.0;
-    constexpr double maxFrequency = 1000.0;
-    constexpr double threshold = 0.20;
     constexpr std::size_t maxWindowSize = 4096;
-
-    const std::size_t windowSize =
-        std::min(samples.size(), maxWindowSize);
+    const std::size_t windowSize = std::min(samples.size(), maxWindowSize);
     const std::size_t minLag = std::max<std::size_t>(
         2,
-        static_cast<std::size_t>(
-            std::ceil(static_cast<double>(sampleRate) / maxFrequency)
-        )
+        static_cast<std::size_t>(std::ceil(
+            static_cast<double>(sampleRate) / options.maxFrequency
+        ))
     );
     const std::size_t maxLag = std::min(
         static_cast<std::size_t>(
-            static_cast<double>(sampleRate) / minFrequency
+            static_cast<double>(sampleRate) / options.minFrequency
         ),
         windowSize / 2
     );
 
     if (maxLag <= minLag) {
-        return 0.0;
+        return {};
     }
 
-    std::vector<double> signal(windowSize);
     double mean = 0.0;
     for (std::size_t i = 0; i < windowSize; ++i) {
         mean += samples[i];
     }
     mean /= static_cast<double>(windowSize);
 
+    std::vector<double> signal(windowSize);
     double energy = 0.0;
     for (std::size_t i = 0; i < windowSize; ++i) {
-        signal[i] = static_cast<double>(samples[i]) - mean;
+        signal[i] = samples[i] - mean;
         energy += signal[i] * signal[i];
     }
     if (energy == 0.0) {
-        return 0.0;
+        return {};
     }
 
-    std::vector<double> difference(maxLag + 1, 0.0);
     std::vector<double> normalizedDifference(maxLag + 1, 1.0);
     double cumulativeDifference = 0.0;
-
     for (std::size_t lag = 1; lag <= maxLag; ++lag) {
         double sum = 0.0;
         for (std::size_t i = 0; i < windowSize - lag; ++i) {
@@ -64,7 +60,6 @@ double detectPitchYin(
             sum += delta * delta;
         }
 
-        difference[lag] = sum;
         cumulativeDifference += sum;
         normalizedDifference[lag] =
             cumulativeDifference > 0.0
@@ -74,7 +69,7 @@ double detectPitchYin(
 
     std::size_t bestLag = 0;
     for (std::size_t lag = minLag; lag <= maxLag; ++lag) {
-        if (normalizedDifference[lag] < threshold) {
+        if (normalizedDifference[lag] < options.yinThreshold) {
             bestLag = lag;
             while (bestLag < maxLag &&
                    normalizedDifference[bestLag + 1] <
@@ -86,7 +81,14 @@ double detectPitchYin(
     }
 
     if (bestLag == 0) {
-        return 0.0;
+        const double minimumDifference = *std::min_element(
+            normalizedDifference.begin() + minLag,
+            normalizedDifference.begin() + maxLag + 1
+        );
+        return {
+            0.0,
+            std::clamp(1.0 - minimumDifference, 0.0, 1.0)
+        };
     }
 
     double refinedLag = static_cast<double>(bestLag);
@@ -100,5 +102,18 @@ double detectPitchYin(
         }
     }
 
-    return static_cast<double>(sampleRate) / refinedLag;
+    if (refinedLag <= 0.0) {
+        return {};
+    }
+
+    const double frequency = static_cast<double>(sampleRate) / refinedLag;
+    if (frequency < options.minFrequency ||
+        frequency > options.maxFrequency) {
+        return {};
+    }
+
+    return {
+        frequency,
+        std::clamp(1.0 - normalizedDifference[bestLag], 0.0, 1.0)
+    };
 }

@@ -1,9 +1,12 @@
 #pragma once
 
+#include "pitch_detection.hpp"
+
 #include <cstdint>
 #include <vector>
 
-double detectPitch(
-    const std::vector<std::int16_t>& samples,
-    std::uint32_t sampleRate
+PitchEstimate detectPitch(
+    const std::vector<double>& samples,
+    std::uint32_t sampleRate,
+    const PitchDetectionOptions& options
 );

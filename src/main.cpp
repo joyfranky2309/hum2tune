@@ -8,17 +8,38 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <iomanip>
 #include <iostream>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 struct PitchFrame {
     double time;
     double autocorrelationFrequency;
+    double autocorrelationConfidence;
     double yinFrequency;
+    double yinConfidence;
     int midiNote; // -1 means no detected pitch
+};
+
+struct AnalysisConfig {
+    std::string inputPath = "test_audio/nenu_nenugaslowed.wav";
+    std::string midiPath = "output.mid";
+    double frameSeconds = 0.040;
+    double hopSeconds = 0.010;
+    double minFrequency = 80.0;
+    double maxFrequency = 1000.0;
+    double minRms = 250.0;
+    double minNoteDuration = 0.15;
+    double mergeGapSeconds = 0.15;
+    double autocorrelationThreshold = 0.55;
+    double yinThreshold = 0.20;
+    double highPassHz = 75.0;
+    double maxZeroCrossingRate = 0.35;
 };
 
 int frequencyToMidi(double frequency) {
@@ -29,6 +50,151 @@ int frequencyToMidi(double frequency) {
     return static_cast<int>(
         std::round(69.0 + 12.0 * std::log2(frequency / 440.0))
     );
+}
+
+void printUsage(const char* program) {
+    std::cout
+        << "Usage: " << program << " [input.wav] [output.mid] [options]\n"
+        << "Options:\n"
+        << "  --frame-ms VALUE              Analysis frame length (default 40)\n"
+        << "  --hop-ms VALUE                Analysis hop length (default 10)\n"
+        << "  --min-frequency HZ            Minimum pitch (default 80)\n"
+        << "  --max-frequency HZ            Maximum pitch (default 1000)\n"
+        << "  --min-rms VALUE               Minimum adaptive RMS gate (default 250)\n"
+        << "  --max-zcr VALUE               Maximum zero-crossing rate (default 0.35)\n"
+        << "  --autocorrelation-threshold N Peak confidence (0..1, default 0.55)\n"
+        << "  --yin-threshold N             YIN difference threshold (0..1, default 0.20)\n"
+        << "  --high-pass HZ                High-pass cutoff (default 75)\n"
+        << "  --min-note-duration SEC       Minimum MIDI note duration (default 0.15)\n"
+        << "  --merge-gap SEC               Merge same-note gaps (default 0.15)\n"
+        << "  --help                        Show this help\n";
+}
+
+double parseNumber(const std::string& value, const std::string& option) {
+    std::size_t parsedLength = 0;
+    const double result = std::stod(value, &parsedLength);
+    if (parsedLength != value.size() || !std::isfinite(result)) {
+        throw std::invalid_argument("Invalid value for " + option + ": " + value);
+    }
+    return result;
+}
+
+AnalysisConfig parseArguments(int argc, char* argv[]) {
+    AnalysisConfig config;
+    bool inputSet = false;
+    bool outputSet = false;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string argument = argv[i];
+        if (argument == "--help") {
+            printUsage(argv[0]);
+            std::exit(0);
+        }
+
+        const auto readOptionValue = [&]() -> std::string {
+            if (i + 1 >= argc) {
+                throw std::invalid_argument("Missing value for " + argument);
+            }
+            return argv[++i];
+        };
+
+        if (argument == "--frame-ms") {
+            config.frameSeconds =
+                parseNumber(readOptionValue(), argument) / 1000.0;
+        } else if (argument == "--hop-ms") {
+            config.hopSeconds =
+                parseNumber(readOptionValue(), argument) / 1000.0;
+        } else if (argument == "--min-frequency") {
+            config.minFrequency = parseNumber(readOptionValue(), argument);
+        } else if (argument == "--max-frequency") {
+            config.maxFrequency = parseNumber(readOptionValue(), argument);
+        } else if (argument == "--min-rms") {
+            config.minRms = parseNumber(readOptionValue(), argument);
+        } else if (argument == "--max-zcr") {
+            config.maxZeroCrossingRate = parseNumber(
+                readOptionValue(), argument
+            );
+        } else if (argument == "--autocorrelation-threshold") {
+            config.autocorrelationThreshold = parseNumber(
+                readOptionValue(), argument
+            );
+        } else if (argument == "--yin-threshold") {
+            config.yinThreshold = parseNumber(readOptionValue(), argument);
+        } else if (argument == "--high-pass") {
+            config.highPassHz = parseNumber(readOptionValue(), argument);
+        } else if (argument == "--min-note-duration") {
+            config.minNoteDuration = parseNumber(
+                readOptionValue(), argument
+            );
+        } else if (argument == "--merge-gap") {
+            config.mergeGapSeconds = parseNumber(readOptionValue(), argument);
+        } else if (!argument.empty() && argument[0] == '-') {
+            throw std::invalid_argument("Unknown option: " + argument);
+        } else if (!inputSet) {
+            config.inputPath = argument;
+            inputSet = true;
+        } else if (!outputSet) {
+            config.midiPath = argument;
+            outputSet = true;
+        } else {
+            throw std::invalid_argument("Unexpected argument: " + argument);
+        }
+    }
+
+    if (config.frameSeconds <= 0.0 || config.hopSeconds <= 0.0 ||
+        config.hopSeconds > config.frameSeconds ||
+        config.minFrequency < 20.0 ||
+        config.maxFrequency <= config.minFrequency ||
+        config.minRms < 0.0 ||
+        config.maxZeroCrossingRate < 0.0 ||
+        config.maxZeroCrossingRate > 1.0 ||
+        config.autocorrelationThreshold < 0.0 ||
+        config.autocorrelationThreshold > 1.0 ||
+        config.yinThreshold <= 0.0 ||
+        config.yinThreshold > 1.0 ||
+        config.highPassHz < 0.0 ||
+        config.minNoteDuration < 0.0 ||
+        config.mergeGapSeconds < 0.0) {
+        throw std::invalid_argument("One or more options are outside valid ranges");
+    }
+
+    return config;
+}
+
+std::vector<double> applyHighPass(
+    const std::vector<std::int16_t>& samples,
+    std::uint32_t sampleRate,
+    double cutoffHz
+) {
+    std::vector<double> filtered(samples.size());
+    if (cutoffHz <= 0.0) {
+        for (std::size_t i = 0; i < samples.size(); ++i) {
+            filtered[i] = samples[i];
+        }
+        return filtered;
+    }
+
+    const double dt = 1.0 / sampleRate;
+    const double rc = 1.0 / (2.0 * std::acos(-1.0) * cutoffHz);
+    const double alpha = rc / (rc + dt);
+    double previousInput = 0.0;
+    double previousOutput = 0.0;
+    for (std::size_t i = 0; i < samples.size(); ++i) {
+        const double input = samples[i];
+        const double output = alpha * (previousOutput + input - previousInput);
+        filtered[i] = output;
+        previousInput = input;
+        previousOutput = output;
+    }
+    return filtered;
+}
+
+double median(std::vector<double> values) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    std::sort(values.begin(), values.end());
+    return values[values.size() / 2];
 }
 
 std::string noteName(int midiNote) {
@@ -47,66 +213,135 @@ std::string noteName(int midiNote) {
 
 int main(int argc, char* argv[]) {
     try {
-        const std::string path =
-            argc > 1 ? argv[1] : "test_audio/s4.wav";
-        const std::string midiPath  = argc > 2 ? argv[2] : "output.mid";
-
-        const WavData wav = readWav(path);
+        const AnalysisConfig config = parseArguments(argc, argv);
+        const WavData wav = readWav(config.inputPath);
 
         if (wav.sampleRate == 0) {
             std::cerr << "Invalid sample rate.\n";
             return 1;
         }
+        if (config.maxFrequency >= wav.sampleRate / 2.0 ||
+            config.highPassHz >= wav.sampleRate / 2.0) {
+            throw std::invalid_argument(
+                "Frequency limits and high-pass cutoff must be below Nyquist"
+            );
+        }
 
-        constexpr double frameSeconds = 0.040;
-        constexpr double hopSeconds = 0.010;
-
+        const double frameSamples =
+            wav.sampleRate * config.frameSeconds;
+        const double hopSamples =
+            wav.sampleRate * config.hopSeconds;
+        if (!std::isfinite(frameSamples) || !std::isfinite(hopSamples) ||
+            frameSamples >=
+                static_cast<double>(std::numeric_limits<std::size_t>::max()) ||
+            hopSamples >=
+                static_cast<double>(std::numeric_limits<std::size_t>::max())) {
+            throw std::invalid_argument("Frame and hop sizes are too large");
+        }
         const std::size_t frameSize =
-            static_cast<std::size_t>(wav.sampleRate * frameSeconds);
+            static_cast<std::size_t>(frameSamples);
+        const std::size_t hopSize = static_cast<std::size_t>(hopSamples);
 
-        const std::size_t hopSize =
-            static_cast<std::size_t>(wav.sampleRate * hopSeconds);
-
-        if (wav.samples.size() < frameSize) {
+        if (frameSize < 2 || hopSize == 0 ||
+            wav.samples.size() < frameSize) {
             std::cerr << "Audio is shorter than one frame.\n";
             return 1;
         }
 
-        std::vector<PitchFrame> frames;
+        const std::vector<double> filteredSamples =
+            applyHighPass(wav.samples, wav.sampleRate, config.highPassHz);
 
+        struct FrameMetrics {
+            double rms;
+            double zeroCrossingRate;
+        };
+        std::vector<FrameMetrics> metrics;
+        std::vector<double> rmsValues;
         for (std::size_t start = 0;
-             start + frameSize <= wav.samples.size();
+             start + frameSize <= filteredSamples.size();
              start += hopSize) {
-
-            std::vector<std::int16_t> frame(
-                wav.samples.begin() + start,
-                wav.samples.begin() + start + frameSize
-            );
-
-            double frameEnergy = 0.0;
-            for (const std::int16_t sample : frame) {
-                frameEnergy += static_cast<double>(sample) * sample;
+            double energy = 0.0;
+            std::size_t crossings = 0;
+            for (std::size_t i = 0; i < frameSize; ++i) {
+                const double sample = filteredSamples[start + i];
+                energy += sample * sample;
+                if (i > 0 &&
+                    std::signbit(sample) !=
+                        std::signbit(filteredSamples[start + i - 1])) {
+                    ++crossings;
+                }
             }
-            const double rms = std::sqrt(frameEnergy / frame.size());
-            if (rms < 800.0) {
-                frames.push_back({
-                    static_cast<double>(start) / wav.sampleRate,
-                    0.0,
-                    0.0,
-                    -1
-                });
-                continue;
+            const double rms = std::sqrt(energy / frameSize);
+            const double zcr =
+                static_cast<double>(crossings) / (frameSize - 1);
+            metrics.push_back({rms, zcr});
+            rmsValues.push_back(rms);
+        }
+
+        std::vector<double> sortedRms = rmsValues;
+        std::sort(sortedRms.begin(), sortedRms.end());
+        const double noiseFloor =
+            sortedRms[static_cast<std::size_t>((sortedRms.size() - 1) * 0.10)];
+        const double medianRms = median(rmsValues);
+        // Keep the adaptive gate below typical signal level when no silence exists.
+        const double adaptiveRmsThreshold = std::max(
+            config.minRms,
+            std::min(noiseFloor * 1.5, medianRms * 0.8)
+        );
+
+        const PitchDetectionOptions detectorOptions{
+            config.minFrequency,
+            config.maxFrequency,
+            config.autocorrelationThreshold,
+            config.yinThreshold
+        };
+        std::vector<PitchFrame> frames;
+        frames.reserve(metrics.size());
+        for (std::size_t frameIndex = 0, start = 0;
+             frameIndex < metrics.size();
+             ++frameIndex, start += hopSize) {
+            PitchEstimate autocorrelation;
+            PitchEstimate yin;
+            if (metrics[frameIndex].rms >= adaptiveRmsThreshold &&
+                metrics[frameIndex].zeroCrossingRate <=
+                    config.maxZeroCrossingRate) {
+                std::vector<double> windowedFrame(frameSize);
+                for (std::size_t i = 0; i < frameSize; ++i) {
+                    const double hann = 0.5 * (
+                        1.0 - std::cos(
+                            2.0 * std::acos(-1.0) * i / (frameSize - 1)
+                        )
+                    );
+                    windowedFrame[i] = filteredSamples[start + i] * hann;
+                }
+                autocorrelation =
+                    detectPitch(windowedFrame, wav.sampleRate, detectorOptions);
+                yin = detectPitchYin(
+                    windowedFrame, wav.sampleRate, detectorOptions
+                );
             }
 
-            const double autocorrelationFrequency =
-                detectPitch(frame, wav.sampleRate);
-            const double yinFrequency = detectPitchYin(frame, wav.sampleRate);
-
+            const bool voiced =
+                (autocorrelation.frequency > 0.0 &&
+                 autocorrelation.confidence >=
+                     config.autocorrelationThreshold) ||
+                (yin.frequency > 0.0 &&
+                 yin.confidence >= 1.0 - config.yinThreshold);
+            if (!voiced) {
+                autocorrelation.frequency = 0.0;
+                yin.frequency = 0.0;
+            }
             frames.push_back({
                 static_cast<double>(start) / wav.sampleRate,
-                autocorrelationFrequency,
-                yinFrequency,
-                yinFrequency > 0.0 ? frequencyToMidi(yinFrequency) : -1
+                autocorrelation.frequency,
+                autocorrelation.confidence,
+                yin.frequency,
+                yin.confidence,
+                yin.frequency > 0.0
+                    ? frequencyToMidi(yin.frequency)
+                    : autocorrelation.frequency > 0.0
+                        ? frequencyToMidi(autocorrelation.frequency)
+                        : -1
             });
         }
 
@@ -139,12 +374,26 @@ int main(int argc, char* argv[]) {
                 currentNote = autocorrelationNote;
             }
 
-            if (hasAutocorrelation && hasYin &&
-                std::abs(autocorrelationNote - yinNote) == 12) {
-                currentNote = yinNote;
-            } else if (hasAutocorrelation && hasYin &&
-                       std::abs(autocorrelationNote - yinNote) > 1) {
-                currentNote = yinNote;
+            if (hasAutocorrelation && hasYin) {
+                if (std::abs(autocorrelationNote - yinNote) <= 1) {
+                    const double confidenceSum =
+                        frames[i].autocorrelationConfidence +
+                        frames[i].yinConfidence;
+                    currentNote = confidenceSum > 0.0
+                        ? static_cast<int>(std::round(
+                            (autocorrelationNote *
+                                 frames[i].autocorrelationConfidence +
+                             yinNote * frames[i].yinConfidence) /
+                            confidenceSum
+                        ))
+                        : yinNote;
+                } else {
+                    currentNote =
+                        frames[i].autocorrelationConfidence >
+                                frames[i].yinConfidence
+                            ? autocorrelationNote
+                            : yinNote;
+                }
             }
 
             const std::size_t contextBegin =
@@ -217,109 +466,68 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Smooth note labels using the median of nearby voiced frames.
+        // Fill one-frame dropouts only when both surrounding notes agree.
         std::vector<int> smoothed;
         smoothed.reserve(pitchNotes.size());
 
         for (std::size_t i = 0; i < pitchNotes.size(); ++i) {
-            std::vector<int> nearby;
-
-            const std::size_t begin = i > 0 ? i - 1 : 0;
-            const std::size_t end = std::min(pitchNotes.size(), i + 2);
-
-            for (std::size_t j = begin; j < end; ++j) {
-                if (pitchNotes[j] >= 0) {
-                    nearby.push_back(pitchNotes[j]);
-                }
-            }
-
-            if (pitchNotes[i] < 0 || nearby.size() < 3) {
-                smoothed.push_back(pitchNotes[i]);
+            if (pitchNotes[i] < 0 && i > 0 &&
+                i + 1 < pitchNotes.size() &&
+                pitchNotes[i - 1] >= 0 &&
+                pitchNotes[i - 1] == pitchNotes[i + 1]) {
+                smoothed.push_back(pitchNotes[i - 1]);
             } else {
-                std::sort(nearby.begin(), nearby.end());
-                smoothed.push_back(nearby[nearby.size() / 2]);
+                smoothed.push_back(pitchNotes[i]);
             }
         }
 
-        // Group consecutive equal note labels into runs with a two-frame hysteresis.
-        constexpr double minNoteDuration = 0.15;
-        constexpr double mergeGapSeconds = 0.05;
+        // Group consecutive equal note labels and merge brief same-note dropouts.
         std::vector<NoteEvent> events;
-
-        if (!smoothed.empty()) {
-            int currentNote = smoothed[0];
-            std::size_t runStart = 0;
-            int candidateNote = currentNote;
-            std::size_t candidateStreak = 0;
-
-            for (std::size_t i = 1; i < smoothed.size(); ++i) {
-                const int frameNote = smoothed[i];
-
-                if (frameNote == currentNote) {
-                    candidateNote = currentNote;
-                    candidateStreak = 0;
-                    continue;
-                }
-
-                if (frameNote != candidateNote) {
-                    candidateNote = frameNote;
-                    candidateStreak = 1;
-                    continue;
-                }
-
-                ++candidateStreak;
-                if (candidateStreak >= 2) {
-                    const double startTime = frames[runStart].time;
-                    const double endTime =
-                        frames[i - 2].time + hopSeconds;
-                    if (currentNote >= 0) {
-                        events.push_back({currentNote, startTime, endTime});
-                    }
-
-                    runStart = i - 1;
-                    currentNote = candidateNote;
-                    candidateNote = currentNote;
-                    candidateStreak = 0;
-                }
+        for (std::size_t begin = 0; begin < smoothed.size();) {
+            const int note = smoothed[begin];
+            std::size_t end = begin + 1;
+            while (end < smoothed.size() && smoothed[end] == note) {
+                ++end;
             }
-
-            const double finalStartTime = frames[runStart].time;
-            const double finalEndTime =
-                frames[smoothed.size() - 1].time + hopSeconds;
-            if (currentNote >= 0) {
-                events.push_back({currentNote, finalStartTime, finalEndTime});
+            if (note >= 0) {
+                events.push_back({
+                    note,
+                    frames[begin].time,
+                    frames[end - 1].time + config.hopSeconds
+                });
             }
+            begin = end;
         }
 
-        // Merge same notes separated by a short gap.
-        std::vector<NoteEvent> merged;
+        events.erase(
+            std::remove_if(
+                events.begin(),
+                events.end(),
+                [&config](const NoteEvent& event) {
+                    return event.end - event.start < config.minNoteDuration;
+                }
+            ),
+            events.end()
+        );
 
+        std::vector<NoteEvent> merged;
         for (const auto& event : events) {
             if (!merged.empty() &&
                 merged.back().midiNote == event.midiNote &&
-                event.start - merged.back().end <= mergeGapSeconds) {
+                event.start - merged.back().end <=
+                    config.mergeGapSeconds + 1e-9) {
                 merged.back().end = event.end;
             } else {
                 merged.push_back(event);
             }
         }
 
-        merged.erase(
-            std::remove_if(
-                merged.begin(),
-                merged.end(),
-                [minNoteDuration](const NoteEvent& event) {
-                    return event.end - event.start < minNoteDuration;
-                }
-            ),
-            merged.end()
-        );
-
         std::cout << std::fixed << std::setprecision(2);
         std::cout << "Frame-by-frame pitch estimates "
-                  << "(frame " << frameSeconds * 1000.0
-                  << " ms, hop " << hopSeconds * 1000.0 << " ms):\n";
+                  << "(frame " << config.frameSeconds * 1000.0
+                  << " ms, hop " << config.hopSeconds * 1000.0 << " ms):\n";
         std::cout << "Frame,Time (s),Autocorrelation (Hz),YIN (Hz),"
+                     "Autocorrelation confidence,YIN confidence,"
                      "Absolute difference (Hz)\n";
 
         for (std::size_t i = 0; i < frames.size(); ++i) {
@@ -340,6 +548,9 @@ int main(int argc, char* argv[]) {
             }
             std::cout << ',';
 
+            std::cout << frame.autocorrelationConfidence << ','
+                      << frame.yinConfidence << ',';
+
             if (frame.autocorrelationFrequency > 0.0 &&
                 frame.yinFrequency > 0.0) {
                 std::cout << std::abs(
@@ -351,7 +562,7 @@ int main(int argc, char* argv[]) {
             std::cout << '\n';
         }
 
-        std::cout << "\nDetected note events (YIN with octave checks):\n";
+        std::cout << "\nDetected note events (confidence-weighted):\n";
 
         for (const auto& event : merged) {
             std::cout
@@ -367,8 +578,8 @@ int main(int argc, char* argv[]) {
             std::cout << "No stable note events detected.\n";
         }
 
-        writeMidiFile(merged, midiPath);
-        std::cout << "MIDI file written to " << midiPath << '\n';
+        writeMidiFile(merged, config.midiPath);
+        std::cout << "MIDI file written to " << config.midiPath << '\n';
 
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << '\n';

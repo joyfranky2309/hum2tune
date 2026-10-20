@@ -4,6 +4,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -119,6 +120,24 @@ WavData readWav(const std::string& path) {
         throw std::runtime_error(
             "Only PCM 16-bit WAV files are supported"
         );
+    }
+
+    if (wav.samples.size() % wav.channels != 0) {
+        throw std::runtime_error("WAV data does not contain complete sample frames");
+    }
+    if (wav.channels > 1) {
+        const std::size_t frameCount = wav.samples.size() / wav.channels;
+        std::vector<std::int16_t> monoSamples(frameCount);
+        for (std::size_t frame = 0; frame < frameCount; ++frame) {
+            std::int32_t channelSum = 0;
+            for (std::size_t channel = 0; channel < wav.channels; ++channel) {
+                channelSum += wav.samples[frame * wav.channels + channel];
+            }
+            monoSamples[frame] = static_cast<std::int16_t>(
+                channelSum / wav.channels
+            );
+        }
+        wav.samples = std::move(monoSamples);
     }
 
     return wav;

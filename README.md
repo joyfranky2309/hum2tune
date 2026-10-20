@@ -4,14 +4,14 @@ Hum2Tune is a small C++ project that reads a WAV audio file, estimates the domin
 
 The project is effectively a pitch-tracking prototype for monophonic humming or sung tones. It is designed around a simple pipeline:
 
-1. Read a PCM WAV file
-2. Slice it into short frames (40 ms with a 10 ms hop)
+1. Read and downmix 16-bit PCM WAV audio, then high-pass filter it
+2. Slice it into Hann-windowed frames (40 ms with a 10 ms hop by default)
 3. Estimate pitch with two independent methods:
    - normalized autocorrelation
    - YIN-style difference estimation
-4. Reject invalid/octave-mismatched frames using cross-check logic
-5. Smooth the frame-level note labels
-6. Merge consecutive note runs into note events
+4. Gate unvoiced frames using adaptive energy, zero-crossing rate, and detector confidence
+5. Confidence-weight the detector estimates and suppress isolated pitch spikes
+6. Bridge short same-note dropouts and merge nearby matching note runs
 7. Export the events as MIDI
 
 This README explains everything currently in the repository so a new engineer or an LLM can understand the project without having to reverse-engineer the code.
@@ -68,10 +68,13 @@ The script:
 
 If no arguments are supplied, the program defaults to:
 
-- input: `test_audio/saregamaogg.wav`
+- input: `test_audio/s4.wav`
 - output MIDI: `output.mid`
 
 This is set in `src/main.cpp`.
+
+The input and output paths can be followed or preceded by tuning options.
+See `./build/hum2tune --help` for all supported controls.
 
 ### Example usage
 
@@ -89,6 +92,7 @@ hum2tune/
 ├── output.mid                  # default output MIDI file if generated
 ├── src/
 │   ├── main.cpp                # main analysis pipeline and terminal output
+│   ├── pitch_detection.hpp    # shared detector estimates and options
 │   ├── pitch_detector.hpp      # autocorrelation pitch detector declaration
 │   ├── pitch_detector.cpp      # normalized autocorrelation estimator
 │   ├── yin_pitch_detector.hpp  # YIN detector declaration
@@ -132,7 +136,8 @@ Important behavioral details:
 - only 16-bit PCM WAV files are supported
 - `channels` must be non-zero
 - `sampleRate` must be non-zero
-- array is stored as `std::vector<std::int16_t>`
+- samples are stored as mono `std::vector<std::int16_t>`; multichannel PCM
+  input is downmixed by averaging its channels
 
 This is a very simple audio loader and does not handle many compressed or exotic WAV variants.
 
@@ -141,17 +146,17 @@ This is a very simple audio loader and does not handle many compressed or exotic
 Purpose: estimate pitch using normalized autocorrelation.
 
 Function:
-- `double detectPitch(const std::vector<std::int16_t>& samples, std::uint32_t sampleRate);`
+- `PitchEstimate detectPitch(const std::vector<double>& samples, std::uint32_t sampleRate, const PitchDetectionOptions& options);`
 
 Algorithm summary:
 - reject invalid or too-short input
-- set bounds for valid frequency search: 80 Hz to 1000 Hz
+- search a configurable frequency range (defaults: 80 Hz to 1000 Hz)
 - limit analysis window to 4096 samples max
 - compute the mean of the frame and remove it
 - for each lag between minimum and maximum allowed lag, compute normalized correlation
-- look for a strong local peak above a threshold (`0.80`)
+- choose the strongest local peak above the configured threshold
 - refine the lag via parabola interpolation around the strongest peak
-- convert lag to frequency via `sampleRate / lag`
+- return frequency and peak-strength confidence
 
 This is a classic autocorrelation-based pitch detector. It is intentionally tuned for speech/hum-like monophonic signals.
 
@@ -160,18 +165,18 @@ This is a classic autocorrelation-based pitch detector. It is intentionally tune
 Purpose: estimate pitch using a YIN-style difference approach.
 
 Function:
-- `double detectPitchYin(const std::vector<std::int16_t>& samples, std::uint32_t sampleRate);`
+- `PitchEstimate detectPitchYin(const std::vector<double>& samples, std::uint32_t sampleRate, const PitchDetectionOptions& options);`
 
 Algorithm summary:
-- similar windowing and frequency range limits
+- uses the same configurable frequency range
 - subtract mean from samples
 - compute squared differences between signal and delayed copies
 - cumulative/normalized difference values are tracked
 - detect the first lag where normalized difference drops below threshold
 - refine candidate lag with a local quadratic interpolation
-- convert to frequency using `sampleRate / lag`
+- return frequency and confidence derived from the selected minimum difference
 
-The YIN estimator is used as a second opinion and is cross-checked against the autocorrelation result in the main pipeline.
+The YIN estimator is used as a second opinion and is confidence-weighted against the autocorrelation result in the main pipeline.
 
 ### 4. `src/midi_writer.*`
 
@@ -266,18 +271,11 @@ Then it ensures:
 
 ### Frame generation
 
-For each window position:
-
-```cpp
-for (std::size_t start = 0;
-     start + frameSize <= wav.samples.size();
-     start += hopSize) {
-```
-
-The program makes a temp vector containing the next frame and computes:
-
-- `autocorrelationFrequency = detectPitch(frame, wav.sampleRate);`
-- `yinFrequency = detectPitchYin(frame, wav.sampleRate);`
+The program downmixes multichannel WAV data to mono, applies a 75 Hz
+high-pass filter, then analyzes 40 ms frames with a 10 ms hop. A Hann window
+is applied to each frame before both detectors run. The RMS gate adapts to
+the quiet end of the recording while respecting the configurable minimum RMS;
+zero-crossing rate and detector confidence also participate in voicing.
 
 The `PitchFrame` struct is used to store:
 
@@ -285,57 +283,37 @@ The `PitchFrame` struct is used to store:
 struct PitchFrame {
     double time;
     double autocorrelationFrequency;
+    double autocorrelationConfidence;
     double yinFrequency;
+    double yinConfidence;
     int midiNote;
 };
 ```
 
-### Cross-check logic
+### Detector agreement and smoothing
 
-The code then looks for cases where the two estimators agree within a plausible octave range. It checks whether:
-
-```cpp
-std::abs(autocorrelationNote - yinNote) < 11 ||
-std::abs(autocorrelationNote - yinNote) > 13
-```
-
-This is weird but intentional: it is trying to reject octave errors and keep only frames where both detectors are in a compatible octave range.
-
-Then it builds a local context window around the current frame and evaluates nearby frames. If several nearby frames agree, it picks a median note label.
-
-### Smoothing
-
-The program does a median-based smoothing step using nearby voiced frames. This reduces single-frame jitter and helps stabilize note labels.
-
-```cpp
-if (pitchNotes[i] < 0 || nearby.size() < 3) {
-    smoothed.push_back(pitchNotes[i]);
-} else {
-    std::sort(nearby.begin(), nearby.end());
-    smoothed.push_back(nearby[nearby.size() / 2]);
-}
-```
+The strongest eligible autocorrelation peak and the first eligible YIN
+minimum provide frequency and confidence estimates. Agreement is confidence
+weighted; nearby frames where both estimators agree can help resolve octave
+disagreements. A single unvoiced frame between matching notes is filled.
 
 ### Event grouping
 
-Same-valued note labels are grouped into consecutive runs:
+Same-valued note labels are grouped into runs. Same-note events separated by
+gaps up to 0.15 seconds are merged by default after sub-minimum blips are
+removed, and events shorter than 0.15 seconds are dropped. These values are
+configurable to balance fragmentation against preserving repeated notes.
 
-```cpp
-while (begin < smoothed.size()) {
-    const int note = smoothed[begin];
-    std::size_t end = begin + 1;
-
-    while (end < smoothed.size() && smoothed[end] == note) {
-        ++end;
-    }
-
-    // create note event
-}
+```bash
+./run.sh test_audio/meri.wav output.mid \
+  --min-frequency 80 --max-frequency 1000 \
+  --min-rms 250 --merge-gap 0.15 --min-note-duration 0.15
 ```
 
+Run `./build/hum2tune --help` for the complete option list.
+
 Then the code:
-- merges same-note events separated by short gaps
-- drops note events shorter than `0.10` seconds
+- drops note events shorter than the configured minimum duration
 - outputs note events as a vector of `NoteEvent`
 
 ## What the program prints
@@ -344,7 +322,8 @@ The program prints a CSV-like summary to stdout, including:
 
 ```text
 Frame-by-frame pitch estimates (frame 40.00 ms, hop 10.00 ms):
-Frame,Time (s),Autocorrelation (Hz),YIN (Hz),Absolute difference (Hz)
+Frame,Time (s),Autocorrelation (Hz),YIN (Hz),
+Autocorrelation confidence,YIN confidence,Absolute difference (Hz)
 ```
 
 Then it prints one line per detected note event:
