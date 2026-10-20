@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -27,8 +29,9 @@ struct PitchFrame {
 };
 
 struct AnalysisConfig {
-    std::string inputPath = "test_audio/nenu_nenugaslowed.wav";
-    std::string midiPath = "output.mid";
+    std::string inputPath;
+    std::string midiPath;
+    std::string outputDirectory;
     double frameSeconds = 0.040;
     double hopSeconds = 0.010;
     double minFrequency = 80.0;
@@ -42,6 +45,14 @@ struct AnalysisConfig {
     double maxZeroCrossingRate = 0.35;
 };
 
+struct OutputPaths {
+    std::filesystem::path midi;
+    std::filesystem::path framesCsv;
+    std::filesystem::path notesCsv;
+};
+
+std::string noteName(int midiNote);
+
 int frequencyToMidi(double frequency) {
     if (frequency <= 0.0) {
         return -1;
@@ -54,7 +65,9 @@ int frequencyToMidi(double frequency) {
 
 void printUsage(const char* program) {
     std::cout
-        << "Usage: " << program << " [input.wav] [output.mid] [options]\n"
+        << "Usage: " << program
+        << " [input.wav] [output.mid] [--output-dir DIR] [options]\n"
+        << "If paths are omitted, the program asks for the input WAV and output folder.\n"
         << "Options:\n"
         << "  --frame-ms VALUE              Analysis frame length (default 40)\n"
         << "  --hop-ms VALUE                Analysis hop length (default 10)\n"
@@ -67,6 +80,7 @@ void printUsage(const char* program) {
         << "  --high-pass HZ                High-pass cutoff (default 75)\n"
         << "  --min-note-duration SEC       Minimum MIDI note duration (default 0.15)\n"
         << "  --merge-gap SEC               Merge same-note gaps (default 0.15)\n"
+        << "  --output-dir DIR              Folder for MIDI and analysis reports\n"
         << "  --help                        Show this help\n";
 }
 
@@ -128,6 +142,8 @@ AnalysisConfig parseArguments(int argc, char* argv[]) {
             );
         } else if (argument == "--merge-gap") {
             config.mergeGapSeconds = parseNumber(readOptionValue(), argument);
+        } else if (argument == "--output-dir") {
+            config.outputDirectory = readOptionValue();
         } else if (!argument.empty() && argument[0] == '-') {
             throw std::invalid_argument("Unknown option: " + argument);
         } else if (!inputSet) {
@@ -159,6 +175,129 @@ AnalysisConfig parseArguments(int argc, char* argv[]) {
     }
 
     return config;
+}
+
+std::string promptForPath(const std::string& prompt) {
+    std::cout << prompt;
+    std::string path;
+    if (!std::getline(std::cin, path) || path.empty()) {
+        throw std::runtime_error("A path is required.");
+    }
+    return path;
+}
+
+OutputPaths prepareOutputPaths(const AnalysisConfig& config) {
+    namespace fs = std::filesystem;
+
+    fs::path directory;
+    const bool hasOutputDirectory = !config.outputDirectory.empty();
+    if (hasOutputDirectory) {
+        directory = config.outputDirectory;
+    } else if (!config.midiPath.empty()) {
+        const fs::path midiArgument(config.midiPath);
+        directory = midiArgument.has_parent_path()
+            ? midiArgument.parent_path()
+            : fs::current_path();
+    } else {
+        directory = promptForPath("Output folder for MIDI and reports: ");
+    }
+
+    if (directory.empty()) {
+        directory = fs::current_path();
+    }
+    fs::create_directories(directory);
+    if (!fs::is_directory(directory)) {
+        throw std::runtime_error(
+            "Output path is not a folder: " + directory.string()
+        );
+    }
+    directory = fs::absolute(directory);
+
+    const fs::path inputPath(config.inputPath);
+    const std::string baseName = inputPath.stem().empty()
+        ? "hum2tune"
+        : inputPath.stem().string();
+
+    fs::path midiPath;
+    if (!config.midiPath.empty()) {
+        const fs::path requestedMidi(config.midiPath);
+        midiPath = hasOutputDirectory
+            ? directory / requestedMidi.filename()
+            : requestedMidi;
+        if (midiPath.parent_path().empty()) {
+            midiPath = directory / midiPath;
+        }
+    } else {
+        midiPath = directory / (baseName + ".mid");
+    }
+
+    return {
+        midiPath,
+        directory / (baseName + "_frames.csv"),
+        directory / (baseName + "_notes.csv")
+    };
+}
+
+void writeAnalysisReports(
+    const OutputPaths& paths,
+    const std::vector<PitchFrame>& frames,
+    const std::vector<int>& processedNotes,
+    const std::vector<NoteEvent>& notes
+) {
+    std::ofstream frameOutput(paths.framesCsv);
+    if (!frameOutput) {
+        throw std::runtime_error(
+            "Could not open frame report: " + paths.framesCsv.string()
+        );
+    }
+    frameOutput << "frame,time_seconds,autocorrelation_hz,yin_hz,"
+                   "autocorrelation_confidence,yin_confidence,"
+                   "absolute_difference_hz,processed_midi_note\n"
+                << std::fixed << std::setprecision(6);
+    for (std::size_t i = 0; i < frames.size(); ++i) {
+        const auto& frame = frames[i];
+        frameOutput << i + 1 << ',' << frame.time << ',';
+        if (frame.autocorrelationFrequency > 0.0) {
+            frameOutput << frame.autocorrelationFrequency;
+        }
+        frameOutput << ',';
+        if (frame.yinFrequency > 0.0) {
+            frameOutput << frame.yinFrequency;
+        }
+        frameOutput << ',' << frame.autocorrelationConfidence << ','
+                    << frame.yinConfidence << ',';
+        if (frame.autocorrelationFrequency > 0.0 &&
+            frame.yinFrequency > 0.0) {
+            frameOutput << std::abs(
+                frame.autocorrelationFrequency - frame.yinFrequency
+            );
+        }
+        frameOutput << ',' << processedNotes[i] << '\n';
+    }
+    if (!frameOutput) {
+        throw std::runtime_error(
+            "Could not write frame report: " + paths.framesCsv.string()
+        );
+    }
+
+    std::ofstream notesOutput(paths.notesCsv);
+    if (!notesOutput) {
+        throw std::runtime_error(
+            "Could not open note report: " + paths.notesCsv.string()
+        );
+    }
+    notesOutput << "note,midi_note,start_seconds,end_seconds,duration_seconds\n"
+                << std::fixed << std::setprecision(6);
+    for (const auto& note : notes) {
+        notesOutput << noteName(note.midiNote) << ',' << note.midiNote << ','
+                    << note.start << ',' << note.end << ','
+                    << note.end - note.start << '\n';
+    }
+    if (!notesOutput) {
+        throw std::runtime_error(
+            "Could not write note report: " + paths.notesCsv.string()
+        );
+    }
 }
 
 std::vector<double> applyHighPass(
@@ -213,7 +352,10 @@ std::string noteName(int midiNote) {
 
 int main(int argc, char* argv[]) {
     try {
-        const AnalysisConfig config = parseArguments(argc, argv);
+        AnalysisConfig config = parseArguments(argc, argv);
+        if (config.inputPath.empty()) {
+            config.inputPath = promptForPath("Input WAV file: ");
+        }
         const WavData wav = readWav(config.inputPath);
 
         if (wav.sampleRate == 0) {
@@ -226,6 +368,7 @@ int main(int argc, char* argv[]) {
                 "Frequency limits and high-pass cutoff must be below Nyquist"
             );
         }
+        const OutputPaths outputPaths = prepareOutputPaths(config);
 
         const double frameSamples =
             wav.sampleRate * config.frameSeconds;
@@ -578,8 +721,11 @@ int main(int argc, char* argv[]) {
             std::cout << "No stable note events detected.\n";
         }
 
-        writeMidiFile(merged, config.midiPath);
-        std::cout << "MIDI file written to " << config.midiPath << '\n';
+        writeMidiFile(merged, outputPaths.midi.string());
+        writeAnalysisReports(outputPaths, frames, smoothed, merged);
+        std::cout << "MIDI file written to " << outputPaths.midi << '\n'
+                  << "Frame report written to " << outputPaths.framesCsv << '\n'
+                  << "Note report written to " << outputPaths.notesCsv << '\n';
 
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << '\n';

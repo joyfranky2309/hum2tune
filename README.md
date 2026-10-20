@@ -28,11 +28,11 @@ It is not a full music transcription engine. It is closer to a proof-of-concept 
 
 At the moment, the project is a working C++ command-line utility that:
 
-- accepts a WAV input file
+- prompts for a WAV input and output folder when paths are omitted, or accepts paths as command-line arguments
 - analyzes it frame by frame
 - prints pitch estimates to stdout
 - emits note events to stdout
-- writes a MIDI file to disk
+- writes a MIDI file and frame/note CSV reports to the chosen output folder
 
 The repository includes a known test file and a comparison document showing the detector correctly identifies the reference melody in a generated test sample.
 
@@ -53,34 +53,44 @@ cmake -S . -B build
 cmake --build build
 ```
 
-### Convenience runner
+### Interactive use
+
+Run the application without paths to be prompted for a WAV file and an output
+folder:
 
 ```bash
-./run.sh [input.wav] [output.mid]
+./run.sh
 ```
 
-The script:
-- configures CMake in `build/`
-- builds the executable
-- runs `build/hum2tune` with the arguments you passed
+The program creates the output folder if needed. It saves three files there:
 
-### Default behavior
+- `<input-name>.mid` — detected notes as MIDI
+- `<input-name>_frames.csv` — frame-by-frame pitch and confidence data
+- `<input-name>_notes.csv` — detected note events and durations
 
-If no arguments are supplied, the program defaults to:
+### Command-line use
 
-- input: `test_audio/s4.wav`
-- output MIDI: `output.mid`
-
-This is set in `src/main.cpp`.
-
-The input and output paths can be followed or preceded by tuning options.
-See `./build/hum2tune --help` for all supported controls.
-
-### Example usage
+Provide the input WAV and output folder directly to avoid prompts:
 
 ```bash
-./run.sh test_audio/hum2tune_known_notes.wav output.mid
+./run.sh test_audio/hum2tune_known_notes.wav --output-dir ~/Hum2Tune/results
 ```
+
+To retain the previous explicit MIDI filename syntax, pass it as the second
+positional argument. Reports are saved beside the MIDI:
+
+```bash
+./run.sh test_audio/hum2tune_known_notes.wav results/known.mid
+```
+
+The input path, MIDI path, and options can be combined:
+
+```bash
+./run.sh test_audio/meri.wav --output-dir ~/Hum2Tune/results \
+  --min-frequency 80 --max-frequency 1000 --merge-gap 0.15
+```
+
+Run `./build/hum2tune --help` for all tuning options.
 
 ## Repository structure
 
@@ -89,7 +99,7 @@ hum2tune/
 ├── CMakeLists.txt
 ├── run.sh
 ├── build/                      # generated build artifacts
-├── output.mid                  # default output MIDI file if generated
+├── output.mid                  # existing example MIDI artifact
 ├── src/
 │   ├── main.cpp                # main analysis pipeline and terminal output
 │   ├── pitch_detection.hpp    # shared detector estimates and options
@@ -329,14 +339,17 @@ Autocorrelation confidence,YIN confidence,Absolute difference (Hz)
 Then it prints one line per detected note event:
 
 ```text
-Detected note events (YIN with octave checks):
+Detected note events (confidence-weighted):
 C4 | MIDI 60 | start 0.00 s | end 0.39 s | duration 0.39 s
 ```
 
-After that, it writes output to MIDI:
+After that, it writes the MIDI plus frame and note CSV reports into the
+selected output folder:
 
 ```text
-MIDI file written to output.mid
+MIDI file written to <output-folder>/<input-name>.mid
+Frame report written to <output-folder>/<input-name>_frames.csv
+Note report written to <output-folder>/<input-name>_notes.csv
 ```
 
 ## Expected audio input characteristics
@@ -347,7 +360,7 @@ The current detector is tuned for:
 - reasonably steady pitch
 - sample rate above zero
 - 16-bit PCM WAV
-- single-channel or at least a single active channel in the data block
+- mono or multichannel input (multichannel audio is downmixed)
 - target frequencies roughly in the range 80 Hz to 1000 Hz
 
 It is not built for:
