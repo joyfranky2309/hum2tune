@@ -48,7 +48,7 @@ std::string noteName(int midiNote) {
 int main(int argc, char* argv[]) {
     try {
         const std::string path =
-            argc > 1 ? argv[1] : "test_audio/nenu_nenugaslowed.wav";
+            argc > 1 ? argv[1] : "test_audio/s4.wav";
         const std::string midiPath  = argc > 2 ? argv[2] : "output.mid";
 
         const WavData wav = readWav(path);
@@ -83,23 +83,24 @@ int main(int argc, char* argv[]) {
                 wav.samples.begin() + start + frameSize
             );
 
-            const double hannWindowScale =
-                frame.size() > 1 ? (2.0 * std::acos(-1.0) /
-                    static_cast<double>(frame.size() - 1)) : 0.0;
-            std::vector<std::int16_t> windowedFrame(frame.size());
-            for (std::size_t i = 0; i < frame.size(); ++i) {
-                const double window = 0.5 - 0.5 * std::cos(
-                    hannWindowScale * static_cast<double>(i)
-                );
-                windowedFrame[i] = static_cast<std::int16_t>(
-                    std::round(static_cast<double>(frame[i]) * window)
-                );
+            double frameEnergy = 0.0;
+            for (const std::int16_t sample : frame) {
+                frameEnergy += static_cast<double>(sample) * sample;
+            }
+            const double rms = std::sqrt(frameEnergy / frame.size());
+            if (rms < 800.0) {
+                frames.push_back({
+                    static_cast<double>(start) / wav.sampleRate,
+                    0.0,
+                    0.0,
+                    -1
+                });
+                continue;
             }
 
             const double autocorrelationFrequency =
-                detectPitch(windowedFrame, wav.sampleRate);
-            const double yinFrequency =
-                detectPitchYin(windowedFrame, wav.sampleRate);
+                detectPitch(frame, wav.sampleRate);
+            const double yinFrequency = detectPitchYin(frame, wav.sampleRate);
 
             frames.push_back({
                 static_cast<double>(start) / wav.sampleRate,
@@ -131,21 +132,19 @@ int main(int argc, char* argv[]) {
                 ? frequencyToMidi(frames[i].yinFrequency)
                 : -1;
 
+            int currentNote = -1;
             if (hasYin) {
-                pitchNotes[i] = yinNote;
+                currentNote = yinNote;
             } else if (hasAutocorrelation) {
-                pitchNotes[i] = autocorrelationNote;
+                currentNote = autocorrelationNote;
             }
 
             if (hasAutocorrelation && hasYin &&
                 std::abs(autocorrelationNote - yinNote) == 12) {
-                pitchNotes[i] = yinNote;
-                continue;
-            }
-
-            if (hasAutocorrelation && hasYin &&
-                std::abs(autocorrelationNote - yinNote) > 1) {
-                pitchNotes[i] = yinNote;
+                currentNote = yinNote;
+            } else if (hasAutocorrelation && hasYin &&
+                       std::abs(autocorrelationNote - yinNote) > 1) {
+                currentNote = yinNote;
             }
 
             const std::size_t contextBegin =
@@ -170,19 +169,51 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            if (agreedNotes.size() < 3) {
+            if (agreedNotes.size() >= 3) {
+                std::sort(agreedNotes.begin(), agreedNotes.end());
+                const int contextNote = agreedNotes[agreedNotes.size() / 2];
+                const int autocorrelationDistance =
+                    std::abs(autocorrelationNote - contextNote);
+                const int yinDistance = std::abs(yinNote - contextNote);
+                if (autocorrelationDistance <= 2 && yinDistance >= 8) {
+                    currentNote = autocorrelationNote;
+                } else if (yinDistance <= 2 && autocorrelationDistance >= 8) {
+                    currentNote = yinNote;
+                }
+            }
+
+            pitchNotes[i] = currentNote;
+        }
+
+        const std::vector<int> unsuppressedPitchNotes = pitchNotes;
+        for (std::size_t i = 0; i < unsuppressedPitchNotes.size(); ++i) {
+            const int currentNote = unsuppressedPitchNotes[i];
+            if (currentNote < 0) {
                 continue;
             }
 
-            std::sort(agreedNotes.begin(), agreedNotes.end());
-            const int contextNote = agreedNotes[agreedNotes.size() / 2];
-            const int autocorrelationDistance =
-                std::abs(autocorrelationNote - contextNote);
-            const int yinDistance = std::abs(yinNote - contextNote);
-            if (autocorrelationDistance <= 2 && yinDistance >= 8) {
-                pitchNotes[i] = autocorrelationNote;
-            } else if (yinDistance <= 2 && autocorrelationDistance >= 8) {
-                pitchNotes[i] = yinNote;
+            int previousValid = -1;
+            for (std::ptrdiff_t j = static_cast<std::ptrdiff_t>(i) - 1; j >= 0; --j) {
+                const int note =
+                    unsuppressedPitchNotes[static_cast<std::size_t>(j)];
+                if (note >= 0) {
+                    previousValid = note;
+                    break;
+                }
+            }
+
+            int nextValid = -1;
+            for (std::size_t j = i + 1; j < unsuppressedPitchNotes.size(); ++j) {
+                if (unsuppressedPitchNotes[j] >= 0) {
+                    nextValid = unsuppressedPitchNotes[j];
+                    break;
+                }
+            }
+
+            if (previousValid >= 0 && nextValid >= 0 &&
+                std::abs(currentNote - previousValid) > 2 &&
+                std::abs(currentNote - nextValid) > 2) {
+                pitchNotes[i] = -1;
             }
         }
 
@@ -193,9 +224,8 @@ int main(int argc, char* argv[]) {
         for (std::size_t i = 0; i < pitchNotes.size(); ++i) {
             std::vector<int> nearby;
 
-            const std::size_t begin = i > 2 ? i - 2 : 0;
-            const std::size_t end =
-                std::min(pitchNotes.size(), i + 3);
+            const std::size_t begin = i > 0 ? i - 1 : 0;
+            const std::size_t end = std::min(pitchNotes.size(), i + 2);
 
             for (std::size_t j = begin; j < end; ++j) {
                 if (pitchNotes[j] >= 0) {
@@ -211,29 +241,54 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Group consecutive equal note labels into runs.
-        constexpr double minNoteDuration = 0.10;
+        // Group consecutive equal note labels into runs with a two-frame hysteresis.
+        constexpr double minNoteDuration = 0.15;
+        constexpr double mergeGapSeconds = 0.05;
         std::vector<NoteEvent> events;
-        std::size_t begin = 0;
 
-        while (begin < smoothed.size()) {
-            const int note = smoothed[begin];
-            std::size_t end = begin + 1;
+        if (!smoothed.empty()) {
+            int currentNote = smoothed[0];
+            std::size_t runStart = 0;
+            int candidateNote = currentNote;
+            std::size_t candidateStreak = 0;
 
-            while (end < smoothed.size() &&
-                   smoothed[end] == note) {
-                ++end;
+            for (std::size_t i = 1; i < smoothed.size(); ++i) {
+                const int frameNote = smoothed[i];
+
+                if (frameNote == currentNote) {
+                    candidateNote = currentNote;
+                    candidateStreak = 0;
+                    continue;
+                }
+
+                if (frameNote != candidateNote) {
+                    candidateNote = frameNote;
+                    candidateStreak = 1;
+                    continue;
+                }
+
+                ++candidateStreak;
+                if (candidateStreak >= 2) {
+                    const double startTime = frames[runStart].time;
+                    const double endTime =
+                        frames[i - 2].time + hopSeconds;
+                    if (currentNote >= 0) {
+                        events.push_back({currentNote, startTime, endTime});
+                    }
+
+                    runStart = i - 1;
+                    currentNote = candidateNote;
+                    candidateNote = currentNote;
+                    candidateStreak = 0;
+                }
             }
 
-            const double startTime = frames[begin].time;
-            const double endTime =
-                frames[end - 1].time + hopSeconds;
-
-            if (note >= 0) {
-                events.push_back({note, startTime, endTime});
+            const double finalStartTime = frames[runStart].time;
+            const double finalEndTime =
+                frames[smoothed.size() - 1].time + hopSeconds;
+            if (currentNote >= 0) {
+                events.push_back({currentNote, finalStartTime, finalEndTime});
             }
-
-            begin = end;
         }
 
         // Merge same notes separated by a short gap.
@@ -242,7 +297,7 @@ int main(int argc, char* argv[]) {
         for (const auto& event : events) {
             if (!merged.empty() &&
                 merged.back().midiNote == event.midiNote &&
-                event.start - merged.back().end <= 0.20) {
+                event.start - merged.back().end <= mergeGapSeconds) {
                 merged.back().end = event.end;
             } else {
                 merged.push_back(event);
